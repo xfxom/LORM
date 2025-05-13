@@ -1,7 +1,9 @@
 package com.db.kurs.orm.repository.factory.executor;
 
+import com.db.kurs.orm.annotation.Table;
 import com.db.kurs.orm.mapper.EntityMapper;
 import com.db.kurs.orm.mapper.QueryExecutor;
+import com.db.kurs.orm.metadata.EntityMetadata;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import java.sql.Types;
@@ -18,6 +20,7 @@ public class PreparedQueryExecutor implements QueryExecutor {
     private final int[] paramOrder;
     private final Class<?> elementType;
     private final boolean isList;
+    private final boolean isEntity;
 
     public PreparedQueryExecutor(JdbcTemplate jdbcTemplate,
                                  EntityMapper entityMapper,
@@ -28,27 +31,27 @@ public class PreparedQueryExecutor implements QueryExecutor {
         this.entityMapper = entityMapper;
         this.elementType = elementType;
         this.isList = isList;
+        // считаем, что «сущность» — это класс с @Table и хотя бы одним @Id
+        this.isEntity = elementType.isAnnotationPresent(Table.class)
+                && !new EntityMetadata(elementType).idFields.isEmpty();
 
-        // 1) Найти все вхождения ?<number> и собрать номера
+        // разбираем ?1,?2 → ? и собираем paramOrder (ваш уже готовый код)
         Pattern p = Pattern.compile("\\?(\\d+)");
         Matcher m = p.matcher(sql);
         StringBuffer sb = new StringBuffer();
         List<Integer> order = new ArrayList<>();
         while (m.find()) {
-            int idx = Integer.parseInt(m.group(1)) - 1; // 1‑based -> 0‑based
-            order.add(idx);
-            m.appendReplacement(sb, "?"); // заменяем "?2" → "?"
+            order.add(Integer.parseInt(m.group(1)) - 1);
+            m.appendReplacement(sb, "?");
         }
         m.appendTail(sb);
-
         this.parsedSql = sb.toString();
-        this.paramOrder = order.isEmpty()
-                ? null
-                : order.stream().mapToInt(i -> i).toArray();
+        this.paramOrder = order.isEmpty() ? null : order.stream().mapToInt(i -> i).toArray();
     }
 
     @Override
     public Object execute(Object[] args) {
+        // перестановка по paramOrder
         Object[] finalArgs = args;
         if (paramOrder != null) {
             finalArgs = new Object[paramOrder.length];
@@ -67,22 +70,25 @@ public class PreparedQueryExecutor implements QueryExecutor {
             return null;
         }
 
-        RowMapper<?> rm = (rs, rowNum) -> entityMapper.map(rs, elementType);
-        List<?> result;
-
-        if (finalArgs != null && finalArgs.length > 0) {
-            // Определяем JDBC-типы для каждого аргумента
-            int[] types = resolveTypes(finalArgs);
-            result = jdbcTemplate.query(parsedSql, finalArgs, types, rm);
-        } else {
-            result = jdbcTemplate.query(parsedSql, rm);
+        if (!isEntity) {
+            // СКАЛЯРЫ / DTO: просто вытаскиваем из первой колонки
+            if (isList) {
+                return jdbcTemplate.queryForList(parsedSql, elementType, finalArgs);
+            } else {
+                return jdbcTemplate.queryForObject(parsedSql, elementType, finalArgs);
+            }
         }
+
+        // ЕЩЁ ЗДЕСЬ — сущности, мапим через EntityMapper
+        RowMapper<?> rm = (rs, rowNum) -> entityMapper.map(rs, elementType);
+        List<?> result = (finalArgs != null && finalArgs.length > 0)
+                ? jdbcTemplate.query(parsedSql, finalArgs, rm)
+                : jdbcTemplate.query(parsedSql, rm);
 
         return isList ? result : (result.isEmpty() ? null : result.get(0));
     }
-
     /**
-     * Вспомогательный метод: на основе типа Java-объекта возвращает java.sql.Types
+     *  на основе типа Java-объекта возвращает java.sql.Types
      */
     private int[] resolveTypes(Object[] args) {
         int[] types = new int[args.length];
